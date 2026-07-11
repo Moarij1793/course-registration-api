@@ -31,8 +31,10 @@ jobs:
           flake8 main.py tests
 
       - name: Run tests with coverage
-        run: |
-          pytest tests/test_api.py --cov=main --cov-report=term-missing --cov-fail-under=80
+  env:
+    PYTHONPATH: .
+  run: |
+    python -m pytest tests/test_api.py --cov=main --cov-report=term-missing --cov-fail-under=80
 
       - name: Start API
         run: |
@@ -44,7 +46,7 @@ jobs:
           curl --fail http://127.0.0.1:8000/
 
       - name: Run integration test
-        run: |
-          pytest tests/test_integration.py
-
-          
+  env:
+    PYTHONPATH: .
+  run: |
+    python -m pytest tests/test_integration.py
