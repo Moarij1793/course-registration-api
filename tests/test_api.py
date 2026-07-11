@@ -404,5 +404,3 @@ def test_student_isolation_and_unknown_student():
     )
 
     assert response.status_code == 404
-
-    

@@ -218,7 +218,7 @@ def parse_catalog_html(html: str) -> dict[str, dict[str, Any]]:
         if header_map is None or header_row_position is None:
             continue
 
-        for row in rows[header_row_position + 1 :]:
+        for row in rows[header_row_position + 1:]:
             cells = row.find_all(["td", "th"])
 
             if not cells:
@@ -343,7 +343,7 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
         if header_map is None or header_row_position is None:
             continue
 
-        for row in rows[header_row_position + 1 :]:
+        for row in rows[header_row_position + 1:]:
             cells = row.find_all(["td", "th"])
 
             if not cells:
@@ -1013,6 +1013,3 @@ def get_audit_report(
         "cross_list_violations": cross_list_violations,
         "credit_summary": credit_summary,
     }
-
-
-    
