@@ -1,24 +1,36 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from typing import Any
 
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 
 
 app = FastAPI(
     title="COSC 3506 Course Registration API",
-    version="2.0.0",
+    version="3.0.0",
 )
 
-# Phase 1: global catalog shared by all students.
+# -------------------------------------------------------------------
+# Application state
+# -------------------------------------------------------------------
+
+# Phase 1 catalog:
+# {
+#     "COSC3506": {
+#         "course_code": "COSC 3506",
+#         "title": "Software Systems Development",
+#         "credits": 3,
+#         "prerequisites": ["COSC 2007"],
+#         "cross_listed": ["ITEC 3506"],
+#     }
+# }
 app.state.catalog: dict[str, dict[str, Any]] = {}
 
-# Phase 2: student-specific state.
-#
-# Example:
+# Phase 2 students:
 # {
 #     "111": {
 #         "history": [...],
@@ -54,42 +66,36 @@ class PlanPayload(BaseModel):
 
 
 # -------------------------------------------------------------------
-# Shared helper functions
+# Shared utility functions
 # -------------------------------------------------------------------
 
 
 def normalize_course_code(course_code: str) -> str:
     """
-    Make course-code comparison insensitive to spaces, hyphens,
-    and letter case.
+    Convert differently formatted course codes into one comparison form.
 
-    Examples:
-        COSC 3506 -> COSC3506
-        COSC-3506 -> COSC3506
-        cosc3506  -> COSC3506
+    COSC 3506 -> COSC3506
+    COSC-3506 -> COSC3506
+    cosc3506  -> COSC3506
     """
     return re.sub(r"[\s-]+", "", course_code).upper().strip()
 
 
 def normalize_header(header: str) -> str:
     """
-    Convert an HTML header to a simple comparison form.
+    Normalize table headers.
 
-    Example:
-        Course Code -> coursecode
-        Cross-listed -> crosslisted
+    Course Code  -> coursecode
+    Cross-listed -> crosslisted
     """
     return re.sub(r"[^a-z0-9]", "", header.lower())
 
 
 def parse_credits(value: str) -> int:
     """
-    Convert credits into an integer.
+    Convert a credit string to an integer.
 
-    Examples:
-        3   -> 3
-        3.0 -> 3
-        blank or non-numeric -> 0
+    Blank or non-numeric values become zero.
     """
     match = re.search(r"-?\d+(?:\.\d+)?", value)
 
@@ -104,11 +110,7 @@ def parse_credits(value: str) -> int:
 
 def extract_course_codes(text: str) -> list[str]:
     """
-    Extract course codes from prerequisites or cross-listing text.
-
-    Example:
-        Requires COSC 2006 and ITEC-2007
-        -> ["COSC 2006", "ITEC-2007"]
+    Extract course codes from prerequisite and cross-listing text.
     """
     cleaned_text = text.strip()
 
@@ -127,24 +129,33 @@ def extract_course_codes(text: str) -> list[str]:
     pattern = r"\b[A-Za-z]{2,10}\s*[- ]?\s*\d{3,4}[A-Za-z]?\b"
     matches = re.findall(pattern, cleaned_text)
 
-    results: list[str] = []
+    extracted: list[str] = []
     seen: set[str] = set()
 
     for match in matches:
-        displayed_code = re.sub(r"\s+", " ", match.strip())
-        normalized_code = normalize_course_code(displayed_code)
+        display_code = re.sub(r"\s+", " ", match.strip())
+        normalized_code = normalize_course_code(display_code)
 
         if normalized_code not in seen:
             seen.add(normalized_code)
-            results.append(displayed_code)
+            extracted.append(display_code)
 
-    return results
+    return extracted
 
 
-def get_student_or_404(student_id: str) -> dict[str, list[dict[str, Any]]]:
+def model_to_dict(model: BaseModel) -> dict[str, Any]:
     """
-    Return one student or raise HTTP 404.
+    Support both Pydantic version 1 and version 2.
     """
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+
+    return model.dict()
+
+
+def get_student_or_404(
+    student_id: str,
+) -> dict[str, list[dict[str, Any]]]:
     student = app.state.students.get(student_id)
 
     if student is None:
@@ -157,13 +168,13 @@ def get_student_or_404(student_id: str) -> dict[str, list[dict[str, Any]]]:
 
 
 # -------------------------------------------------------------------
-# Phase 1: catalog parser
+# Phase 1 catalog parser
 # -------------------------------------------------------------------
 
 
 def parse_catalog_html(html: str) -> dict[str, dict[str, Any]]:
     """
-    Find the catalog table by its headers and parse all course rows.
+    Locate catalog tables by their headers and parse course rows.
     """
     soup = BeautifulSoup(html, "html.parser")
     parsed_catalog: dict[str, dict[str, Any]] = {}
@@ -214,9 +225,9 @@ def parse_catalog_html(html: str) -> dict[str, dict[str, Any]]:
                 continue
 
             values = [cell.get_text(" ", strip=True) for cell in cells]
-            highest_required_index = max(header_map.values())
+            highest_index = max(header_map.values())
 
-            if len(values) <= highest_required_index:
+            if len(values) <= highest_index:
                 continue
 
             course_code = values[header_map["coursecode"]].strip()
@@ -250,7 +261,7 @@ def parse_catalog_html(html: str) -> dict[str, dict[str, Any]]:
 
 
 # -------------------------------------------------------------------
-# Phase 2: transcript parser
+# Phase 2 transcript parser
 # -------------------------------------------------------------------
 
 
@@ -263,18 +274,15 @@ VALID_HISTORY_STATUSES = {
 
 def grade_information_score(grade: str) -> int:
     """
-    Rank transcript grades for duplicate-course resolution.
+    Duplicate-selection priority:
 
-    Priority:
-        numeric grade > letter grade > P or blank
+    numeric grade > letter grade > P/blank
     """
     cleaned_grade = grade.strip()
 
-    # Numeric examples: 78, 78.5, 78%
     if re.fullmatch(r"\d+(?:\.\d+)?%?", cleaned_grade):
         return 3
 
-    # Letter examples: A, A-, B+, C
     if re.fullmatch(
         r"[A-F](?:[+-])?",
         cleaned_grade,
@@ -282,27 +290,12 @@ def grade_information_score(grade: str) -> int:
     ):
         return 2
 
-    # P and blank are the least informative category.
-    if cleaned_grade == "" or cleaned_grade.upper() == "P":
-        return 1
-
     return 1
 
 
 def parse_transcript_html(html: str) -> list[dict[str, Any]]:
     """
-    Parse all relevant transcript tables.
-
-    A valid history row must have:
-        - Status: Completed, In-Progress, or Attempted
-        - A non-empty term
-
-    Duplicate key:
-        (course_code, term)
-
-    Duplicate winner:
-        1. More informative grade
-        2. Higher credits
+    Parse transcript tables using the canonical Phase 2 rules.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -328,7 +321,6 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
         header_map: dict[str, int] | None = None
         header_row_position: int | None = None
 
-        # Search each table for a valid transcript header row.
         for row_position, row in enumerate(rows):
             cells = row.find_all(["th", "td"])
 
@@ -358,9 +350,9 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
                 continue
 
             values = [cell.get_text(" ", strip=True) for cell in cells]
-            highest_required_index = max(header_map.values())
+            highest_index = max(header_map.values())
 
-            if len(values) <= highest_required_index:
+            if len(values) <= highest_index:
                 continue
 
             row_status = values[header_map["status"]].strip()
@@ -369,7 +361,6 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
             term = values[header_map["term"]].strip()
             credits_text = values[header_map["credits"]].strip()
 
-            # Canonical transcript inclusion rule.
             if row_status not in VALID_HISTORY_STATUSES:
                 continue
 
@@ -398,13 +389,13 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
                 deduplicated[duplicate_key] = candidate
                 continue
 
-            existing_grade_score = existing["_grade_score"]
+            existing_score = existing["_grade_score"]
             existing_credits = existing["credits_earned"]
 
             candidate_is_better = (
-                grade_score > existing_grade_score
+                grade_score > existing_score
                 or (
-                    grade_score == existing_grade_score
+                    grade_score == existing_score
                     and credits_earned > existing_credits
                 )
             )
@@ -428,7 +419,348 @@ def parse_transcript_html(html: str) -> list[dict[str, Any]]:
 
 
 # -------------------------------------------------------------------
-# General API endpoint
+# Phase 3 term and audit utilities
+# -------------------------------------------------------------------
+
+
+SEASON_ORDER = {
+    "W": 1,
+    "SP": 2,
+    "S": 3,
+    "F": 4,
+}
+
+
+def parse_term(term: str) -> tuple[int, int]:
+    """
+    Convert a term into a sortable tuple.
+
+    23F  -> (23, 4)
+    24W  -> (24, 1)
+    26SP -> (26, 2)
+    """
+    cleaned_term = term.strip().upper()
+
+    match = re.fullmatch(r"(\d{2})(W|SP|S|F)", cleaned_term)
+
+    if not match:
+        # Unknown terms are placed after valid terms instead of crashing.
+        return (999, 999)
+
+    year = int(match.group(1))
+    season = match.group(2)
+
+    return (year, SEASON_ORDER[season])
+
+
+def is_strictly_earlier(
+    completed_term: str,
+    planned_term: str,
+) -> bool:
+    """
+    Return True only when the completed term occurs before the
+    planned term.
+    """
+    return parse_term(completed_term) < parse_term(planned_term)
+
+
+def get_completed_history(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Return only completed history records.
+    """
+    return [
+        record
+        for record in history
+        if record.get("status") == "Completed"
+    ]
+
+
+def prerequisite_is_satisfied(
+    prerequisite_code: str,
+    planned_term: str,
+    history: list[dict[str, Any]],
+) -> bool:
+    """
+    A prerequisite is satisfied only when it appears as Completed
+    in a strictly earlier history term.
+    """
+    normalized_prerequisite = normalize_course_code(
+        prerequisite_code
+    )
+
+    for record in history:
+        if record.get("status") != "Completed":
+            continue
+
+        history_code = normalize_course_code(
+            str(record.get("course_code", ""))
+        )
+
+        if history_code != normalized_prerequisite:
+            continue
+
+        history_term = str(record.get("term", ""))
+
+        if is_strictly_earlier(history_term, planned_term):
+            return True
+
+    return False
+
+
+def build_timeline_validation(
+    history: list[dict[str, Any]],
+    plan: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Build prerequisite errors grouped by planned term.
+    """
+    errors_by_term: dict[str, list[dict[str, str]]] = defaultdict(list)
+
+    for planned_course in plan:
+        course_code = str(
+            planned_course.get("course_code", "")
+        )
+        planned_term = str(planned_course.get("term", ""))
+
+        catalog_course = app.state.catalog.get(
+            normalize_course_code(course_code)
+        )
+
+        # A course missing from the catalog cannot provide
+        # prerequisite information. Do not invent an extra error type.
+        if catalog_course is None:
+            continue
+
+        prerequisites = catalog_course.get("prerequisites", [])
+
+        for prerequisite in prerequisites:
+            if prerequisite_is_satisfied(
+                prerequisite,
+                planned_term,
+                history,
+            ):
+                continue
+
+            errors_by_term[planned_term].append(
+                {
+                    "course_code": course_code,
+                    "type": "MISSING_PREREQUISITE",
+                    "message": (
+                        f"Missing prerequisite: {prerequisite}"
+                    ),
+                }
+            )
+
+    ordered_terms = sorted(
+        errors_by_term.keys(),
+        key=parse_term,
+    )
+
+    return [
+        {
+            "term": term,
+            "errors": errors_by_term[term],
+        }
+        for term in ordered_terms
+    ]
+
+
+def find_completed_display_code(
+    normalized_code: str,
+    completed_history: list[dict[str, Any]],
+) -> str | None:
+    """
+    Return the original transcript course code for a completed course.
+    """
+    for record in completed_history:
+        display_code = str(record.get("course_code", ""))
+
+        if normalize_course_code(display_code) == normalized_code:
+            return display_code
+
+    return None
+
+
+def build_cross_list_violations(
+    history: list[dict[str, Any]],
+    plan: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """
+    Detect when a planned course is cross-listed with a course that
+    the student has already completed.
+    """
+    completed_history = get_completed_history(history)
+
+    completed_codes = {
+        normalize_course_code(
+            str(record.get("course_code", ""))
+        )
+        for record in completed_history
+    }
+
+    violations: list[dict[str, str]] = []
+    seen_violations: set[tuple[str, str]] = set()
+
+    for planned_course in plan:
+        planned_code = str(
+            planned_course.get("course_code", "")
+        )
+        planned_normalized = normalize_course_code(planned_code)
+
+        catalog_course = app.state.catalog.get(planned_normalized)
+
+        if catalog_course is None:
+            continue
+
+        direct_cross_listings = {
+            normalize_course_code(code)
+            for code in catalog_course.get("cross_listed", [])
+        }
+
+        # Also inspect completed-course catalog records so the check
+        # works if cross-listing is declared only in the other direction.
+        reverse_cross_listings: set[str] = set()
+
+        for completed_code in completed_codes:
+            completed_catalog_course = app.state.catalog.get(
+                completed_code
+            )
+
+            if completed_catalog_course is None:
+                continue
+
+            completed_cross_listed = {
+                normalize_course_code(code)
+                for code in completed_catalog_course.get(
+                    "cross_listed",
+                    [],
+                )
+            }
+
+            if planned_normalized in completed_cross_listed:
+                reverse_cross_listings.add(completed_code)
+
+        conflicting_completed_codes = (
+            direct_cross_listings.intersection(completed_codes)
+            | reverse_cross_listings
+        )
+
+        for completed_code in sorted(conflicting_completed_codes):
+            completed_display_code = find_completed_display_code(
+                completed_code,
+                completed_history,
+            )
+
+            if completed_display_code is None:
+                completed_display_code = completed_code
+
+            violation_key = (
+                planned_normalized,
+                completed_code,
+            )
+
+            if violation_key in seen_violations:
+                continue
+
+            seen_violations.add(violation_key)
+
+            violations.append(
+                {
+                    "course_code": planned_code,
+                    "type": "CROSS_LIST_CONFLICT",
+                    "message": (
+                        "Cross-listed with completed course "
+                        f"{completed_display_code}"
+                    ),
+                }
+            )
+
+    return violations
+
+
+def calculate_total_earned(
+    history: list[dict[str, Any]],
+) -> int:
+    """
+    Count completed course credits once per normalized course code.
+
+    Attempted and In-Progress courses contribute zero.
+    Multiple completed entries for the same course do not double-count.
+    """
+    completed_credits: dict[str, int] = {}
+
+    for record in history:
+        if record.get("status") != "Completed":
+            continue
+
+        normalized_code = normalize_course_code(
+            str(record.get("course_code", ""))
+        )
+
+        credits = int(record.get("credits_earned", 0) or 0)
+
+        if normalized_code not in completed_credits:
+            completed_credits[normalized_code] = credits
+        else:
+            completed_credits[normalized_code] = max(
+                completed_credits[normalized_code],
+                credits,
+            )
+
+    return sum(completed_credits.values())
+
+
+def calculate_total_planned(
+    plan: list[dict[str, Any]],
+) -> int:
+    """
+    Sum catalog credits for every planned course.
+    """
+    total = 0
+
+    for planned_course in plan:
+        course_code = str(
+            planned_course.get("course_code", "")
+        )
+
+        catalog_course = app.state.catalog.get(
+            normalize_course_code(course_code)
+        )
+
+        if catalog_course is None:
+            continue
+
+        total += int(catalog_course.get("credits", 0) or 0)
+
+    return total
+
+
+def build_credit_summary(
+    history: list[dict[str, Any]],
+    plan: list[dict[str, Any]],
+) -> dict[str, int]:
+    """
+    Calculate earned, planned, and remaining graduation credits.
+    """
+    total_earned = calculate_total_earned(history)
+    total_planned = calculate_total_planned(plan)
+
+    total_remaining = max(
+        0,
+        120 - total_earned - total_planned,
+    )
+
+    return {
+        "total_earned": total_earned,
+        "total_planned": total_planned,
+        "total_remaining_for_graduation": total_remaining,
+    }
+
+
+# -------------------------------------------------------------------
+# Health endpoint
 # -------------------------------------------------------------------
 
 
@@ -438,7 +770,7 @@ def health_check() -> dict[str, str]:
 
 
 # -------------------------------------------------------------------
-# Phase 1 endpoints
+# Phase 1 catalog endpoints
 # -------------------------------------------------------------------
 
 
@@ -466,7 +798,6 @@ async def import_catalog(
             detail="No valid course catalog table was found",
         )
 
-    # Replace the previous global catalog.
     app.state.catalog = parsed_catalog
 
     return {
@@ -513,7 +844,6 @@ async def import_student_history(
     html = raw_content.decode("utf-8-sig", errors="ignore")
     parsed_history = parse_transcript_html(html)
 
-    # Preserve the student's existing plan on re-import.
     existing_student = app.state.students.get(student_id)
 
     if existing_student is None:
@@ -540,7 +870,7 @@ def replace_student_history(
     student = get_student_or_404(student_id)
 
     student["history"] = [
-        course.model_dump()
+        model_to_dict(course)
         for course in payload.history
     ]
 
@@ -576,7 +906,7 @@ def save_student_plan(
     student = get_student_or_404(student_id)
 
     student["plan"] = [
-        course.model_dump()
+        model_to_dict(course)
         for course in payload.planned_courses
     ]
 
@@ -594,7 +924,7 @@ def replace_student_plan(
     student = get_student_or_404(student_id)
 
     student["plan"] = [
-        course.model_dump()
+        model_to_dict(course)
         for course in payload.planned_courses
     ]
 
@@ -618,7 +948,7 @@ def delete_student_plan(
 
 
 # -------------------------------------------------------------------
-# Phase 2 unified profile endpoint
+# Phase 2 profile endpoint
 # -------------------------------------------------------------------
 
 
@@ -628,7 +958,6 @@ def get_student_profile(
 ) -> dict[str, Any]:
     student = get_student_or_404(student_id)
 
-    # Return exactly these three top-level keys.
     return {
         "student_id": student_id,
         "history": student["history"],
@@ -636,3 +965,54 @@ def get_student_profile(
     }
 
 
+# -------------------------------------------------------------------
+# Phase 3 audit endpoint
+# -------------------------------------------------------------------
+
+
+@app.get("/api/v1/students/{student_id}/audit-report")
+def get_audit_report(
+    student_id: str,
+    strict: bool = Query(default=False),
+) -> dict[str, Any]:
+    student = get_student_or_404(student_id)
+
+    history = student["history"]
+    plan = student["plan"]
+
+    timeline_validation = build_timeline_validation(
+        history,
+        plan,
+    )
+
+    cross_list_violations = build_cross_list_violations(
+        history,
+        plan,
+    )
+
+    credit_summary = build_credit_summary(
+        history,
+        plan,
+    )
+
+    has_issues = bool(
+        timeline_validation or cross_list_violations
+    )
+
+    if not has_issues:
+        audit_status = "ok"
+    elif strict:
+        audit_status = "failed"
+    else:
+        audit_status = "warning"
+
+    return {
+        "student_id": student_id,
+        "status": audit_status,
+        "timeline_validation": timeline_validation,
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": credit_summary,
+    }
+
+
+    
