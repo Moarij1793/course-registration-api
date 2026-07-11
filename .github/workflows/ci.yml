@@ -1,0 +1,50 @@
+name: COSC 3506 CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run lint
+        run: |
+          flake8 main.py tests
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/test_api.py --cov=main --cov-report=term-missing --cov-fail-under=80
+
+      - name: Start API
+        run: |
+          uvicorn main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          sleep 5
+
+      - name: Check API health
+        run: |
+          curl --fail http://127.0.0.1:8000/
+
+      - name: Run integration test
+        run: |
+          pytest tests/test_integration.py
+
+          
