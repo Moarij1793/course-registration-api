@@ -12,6 +12,9 @@ jobs:
   quality-gate:
     runs-on: ubuntu-latest
 
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,14 +34,19 @@ jobs:
           flake8 main.py tests
 
       - name: Run tests with coverage
-  env:
-    PYTHONPATH: .
-  run: |
-    python -m pytest tests/test_api.py --cov=main --cov-report=term-missing --cov-fail-under=80
+        run: |
+          python -m pytest tests/test_api.py \
+            --cov=main \
+            --cov-report=term-missing \
+            --cov-fail-under=80
 
       - name: Start API
         run: |
-          uvicorn main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 &
+          nohup uvicorn main:app \
+            --host 0.0.0.0 \
+            --port 8000 \
+            > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
           sleep 5
 
       - name: Check API health
@@ -46,7 +54,10 @@ jobs:
           curl --fail http://127.0.0.1:8000/
 
       - name: Run integration test
-  env:
-    PYTHONPATH: .
-  run: |
-    python -m pytest tests/test_integration.py
+        run: |
+          python -m pytest tests/test_integration.py
+
+      - name: Display API log on failure
+        if: failure()
+        run: |
+          cat uvicorn.log || true
